@@ -19,12 +19,12 @@ Library
   Hs-Source-Dirs:    src
   Exposed-Modules:   Data.Tiled, Data.Tiled.Types, Data.Tiled.Load
   Build-depends:       base >= 4.0
-                     , zlib >= 0.5
-                     , bytestring
-                     , hxt >= 9.0
                      , base64-bytestring > 1
-                     , containers >=0.4 && <0.6
+                     , bytestring
                      , filepath
+                     , hxt >= 9.0
                      , split
+                     , vector
+                     , zlib >= 0.5
 
   Ghc-Options:       -Wall -Werror
