@@ -1,9 +1,11 @@
 {-# LANGUAGE Arrows          #-}
 {-# LANGUAGE LambdaCase      #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TupleSections   #-}
 module Data.Tiled.Load (loadMapFile, loadMap) where
 
 import           Control.Category           (id, (.))
+import           Control.Monad              (join)
 import           Data.Bits                  (clearBit, testBit)
 import qualified Data.ByteString.Base64     as B64
 import qualified Data.ByteString.Char8      as BS
@@ -11,11 +13,12 @@ import qualified Data.ByteString.Lazy.Char8 as LBS
 import           Data.Char                  (digitToInt)
 --import           Data.List                  (unfoldr)
 import           Data.List.Split            (splitOn)
-import           Data.Maybe                 (fromMaybe, isNothing, listToMaybe)
+import           Data.Maybe                 (catMaybes, fromMaybe, listToMaybe)
 import           Data.Tree.NTree.TypeDefs   (NTree)
 import           Data.Vector                (fromList, unfoldr)
 import           Data.Word                  (Word32)
 import           Prelude                    hiding (id, (.))
+import           Safe                       (readMay)
 
 import qualified Codec.Compression.GZip     as GZip
 import qualified Codec.Compression.Zlib     as Zlib
@@ -39,11 +42,11 @@ load a fp = head `fmap` runX (
     >>> getChildren >>> isElem
     >>> doMap fp)
 
-getAttrR :: (Read a, Num a) => String -> IOSArrow XmlTree a
-getAttrR a = arr read . getAttrValue0 a
+getAttrR :: (Read a, Num a) => String -> IOSArrow XmlTree (Maybe a)
+getAttrR a = arr readMay . getAttrValue0 a
 
 getAttrMaybeR :: (Read a, Num a) => String -> IOSArrow XmlTree (Maybe a)
-getAttrMaybeR a = arr (fmap read) . getAttrMaybe a
+getAttrMaybeR a = arr (join . fmap readMay) . getAttrMaybe a
 
 getAttrMaybe :: String -> IOSArrow XmlTree (Maybe String)
 getAttrMaybe a = arr tm . getAttrValue a
@@ -56,41 +59,19 @@ properties = listA $ getChildren >>> isElem >>> hasName "properties"
             >>> getChildren >>> isElem >>> hasName "property"
             >>> getAttrValue "name" &&& getAttrValue "value"
 
-frame :: IOSArrow XmlTree Frame
-frame = getChildren >>> isElem >>> hasName "frame" >>> proc xml -> do
-  frameTileId   <- getAttrR "tileid"   -< xml
-  frameDuration <- getAttrR "duration" -< xml
-  returnA -< Frame{..}
-
-animation :: IOSArrow XmlTree Animation
-animation = getChildren >>> isElem >>> hasName "animation"
-                        >>> listA frame
-                        >>> arr Animation
-
-tile :: IOSArrow XmlTree Tile
-tile = getChildren >>> isElem >>> hasName "tile" >>> getTile
- where getTile :: IOSArrow XmlTree Tile
-       getTile = proc xml -> do
-         tileId          <- getAttrR "id"                 -< xml
-         tileProperties  <- properties                    -< xml
-         tileImage       <- arr listToMaybe . listA image -< xml
-         tileObjectGroup <- doObjectGroup -< xml
-         tileAnimation   <- arr listToMaybe . listA animation -< xml
-         returnA -< Tile{..}
-
 doMap :: FilePath -> IOSArrow XmlTree TiledMap
 doMap mapPath = proc m -> do
     mapOrientation <- arr (\case "orthogonal" -> Orthogonal
                                  "isometric"  -> Isometric
                                  _            -> error "unsupported orientation")
                      . getAttrValue "orientation" -< m
-    mapWidth       <- getAttrR "width"      -< m
-    mapHeight      <- getAttrR "height"     -< m
-    mapTileWidth   <- getAttrR "tilewidth"  -< m
-    mapTileHeight  <- getAttrR "tileheight" -< m
+    mapWidth       <- arr (fromMaybe 0) <<< getAttrR "width"      -< m
+    mapHeight      <- arr (fromMaybe 0) <<< getAttrR "height"     -< m
+    mapTileWidth   <- arr (fromMaybe 0) <<< getAttrR "tilewidth"  -< m
+    mapTileHeight  <- arr (fromMaybe 0) <<< getAttrR "tileheight" -< m
     mapProperties  <- properties            -< m
     mapTilesets    <- tilesets mapPath      -< m
-    mapLayers      <- layers                -< (m, (mapWidth, mapHeight))
+    mapLayers      <- layers -< (m, (mapWidth, mapHeight))
     returnA        -< TiledMap {..}
 
 -- | When you use the tile flipping feature added in Tiled Qt 0.7, the highest
@@ -132,15 +113,15 @@ object :: IOSLA (XIOState ()) (NTree XNode) Object
 object = getChildren >>> isElem >>> hasName "object" >>> proc obj -> do
   objectName       <- arr listToMaybe . listA (getAttrValue "name") -< obj
   objectType       <- arr listToMaybe . listA (getAttrValue "type") -< obj
-  objectX          <- getAttrR "x"                                  -< obj
-  objectY          <- getAttrR "y"                                  -< obj
-  objectWidth      <- arr listToMaybe . listA (getAttrR "width")    -< obj
-  objectHeight     <- arr listToMaybe . listA (getAttrR "height")   -< obj
-  objectGid        <- arr listToMaybe . listA (getAttrR "gid")      -< obj
+  objectX          <- arr (fromMaybe 0) <<< getAttrR "x"            -< obj
+  objectY          <- arr (fromMaybe 0) <<< getAttrR "y"            -< obj
+  objectWidth      <- getAttrMaybeR "width"                         -< obj
+  objectHeight     <- getAttrMaybeR "height"                        -< obj
+  objectGid        <- getAttrMaybeR "gid"                           -< obj
   objectPolygon    <- arr listToMaybe . polygon                     -< obj
   objectPolyline   <- arr listToMaybe . polyline                    -< obj
   objectProperties <- properties                                  -< obj
-  returnA      -< Object {..}
+  returnA          -< Object {..}
 
 doObjectGroup :: IOSLA (XIOState ()) XmlTree [Object]
 doObjectGroup = hasName "objectgroup" >>> listA object
@@ -151,21 +132,16 @@ type LayerFields = (String, Float, Bool, Properties, (Int, Int))
 doLayerFields :: IOSLA (XIOState ()) XmlTree LayerFields
 doLayerFields = proc l -> do
     name       <- getAttrValue "name" -< l
-    opacity    <- arr (fromMaybe (1 :: Float) . listToMaybe)
-                    . listA (getAttrR "opacity") -< l
-    visibility <- arr (isNothing . listToMaybe)
-                    . listA (getAttrValue "visible") -< l
+    opacity    <- arr (fromMaybe (1 :: Float)) <<< getAttrMaybeR "opacity" -< l
+    visibility <- arr (== (1 :: Int)) <<< arr (fromMaybe 1)
+                                      <<< getAttrMaybeR "visible" -< l
     props      <- properties -< l
-    offsetx    <- arr (fromMaybe (0 :: Int) . listToMaybe)
-                    . listA (getAttrR "offsetx") -< l
-    offsety    <- arr (fromMaybe (0 :: Int) . listToMaybe)
-                    . listA (getAttrR "offsety") -< l
+    offsetx    <- arr (fromMaybe (0 :: Int)) <<< getAttrMaybeR "offsetx" -< l
+    offsety    <- arr (fromMaybe (0 :: Int)) <<< getAttrMaybeR "offsety" -< l
     returnA -< (name, opacity, visibility, props, (offsetx, offsety))
 
-doImageLayer :: IOSLA (XIOState ()) (XmlTree, b) Layer
-doImageLayer = arr fst >>> hasName "imagelayer"
-                       >>> id &&& image
-                       >>> proc (l, img) -> do
+doImageLayer :: IOSLA (XIOState ()) XmlTree Layer
+doImageLayer = hasName "imagelayer" >>> id &&& image >>> proc (l, img) -> do
   let layerContents = LayerContentsImage img
   (layerName,layerOpacity,layerIsVisible,layerProperties,layerOffset)
     <- doLayerFields -< l
@@ -220,19 +196,26 @@ common = proc (l, px) -> do
   returnA -< Layer{..}
 
 layers :: IOSArrow (XmlTree, (Int, Int)) [Layer]
-layers = listA (first (getChildren >>> isElem) >>> doObjectLayer
-                                               <+> doLayer
-                                               <+> doImageLayer)
+layers =
+  listA (first (getChildren >>> isElem) >>> (arr Just <<< doObjectLayer)
+                                        <+> (arr Just <<< doLayer)
+                                        <+> (arr fst >>> doImageLayer >>> arr Just))
+    >>> arr catMaybes
   where doObjectLayer =
           arr fst >>> (id &&& (doObjectGroup >>> arr Right)) >>> common
 --------------------------------------------------------------------------------
 -- TileSet
 --------------------------------------------------------------------------------
 tilesets :: FilePath -> IOSArrow XmlTree [Tileset]
-tilesets fp =
-  listA $ getChildren >>> isElem >>> hasName "tileset"
-  >>> getAttrR "firstgid" &&& ifA (hasAttr "source") (externalTileset fp) id
-  >>> tileset
+tilesets fp = arr catMaybes <<<
+  listA (getChildren >>> isElem >>> hasName "tileset" >>> getTheTilesets)
+  where getTheTilesets = proc xml -> do
+          mid <- getAttrR "firstgid" -< xml
+          src <- ifA (hasAttr "source") (externalTileset fp) id -< xml
+          case mid of
+            Just gid -> arr Just <<< tileset -< (gid, src)
+            Nothing  -> returnA -< Nothing
+
 
 externalTileset :: FilePath -> IOSArrow XmlTree XmlTree
 externalTileset mapPath =
@@ -241,18 +224,44 @@ externalTileset mapPath =
   >>> readFromDocument [ withValidate no, withWarnings yes ]
   >>> getChildren >>> isElem >>> hasName "tileset"
 
+frame :: IOSArrow XmlTree (Maybe Frame)
+frame = getChildren >>> isElem >>> hasName "frame" >>> proc xml -> do
+  mid   <- getAttrR "tileid"   -< xml
+  mdur  <- getAttrR "duration" -< xml
+  returnA -< do
+    frameTileId   <- mid
+    frameDuration <- mdur
+    return Frame{..}
+
+animation :: IOSArrow XmlTree Animation
+animation = getChildren >>> isElem >>> hasName "animation"
+                        >>> listA frame >>> arr catMaybes
+                        >>> arr Animation
+
+tile :: IOSArrow XmlTree Tile
+tile = getChildren >>> isElem >>> hasName "tile" >>> getTile
+ where getTile :: IOSArrow XmlTree Tile
+       getTile = proc xml -> do
+         tileId <- arr (fromMaybe 0) <<< getAttrMaybeR "id" -< xml
+         tileProperties  <- properties                      -< xml
+         tileImage       <- arr listToMaybe <<< listA image -< xml
+         tileObjectGroup <- arr (fromMaybe [])
+           <<< arr listToMaybe <<< listA doObjectGroup -< xml
+         tileAnimation   <- arr listToMaybe <<< listA animation -< xml
+         returnA -< Tile{..}
+
 tileset :: IOSArrow (Word32, XmlTree) Tileset
 tileset = proc (tsInitialGid, ts) -> do
-  tsName           <- getAttrValue "name"                           -< ts
-  tsTileWidth      <- getAttrR "tilewidth"                          -< ts
-  tsTileHeight     <- getAttrR "tileheight"                         -< ts
-  tsTileCount      <- arr (fromMaybe 0) . getAttrMaybeR "tilecount" -< ts
-  tsMargin         <- arr (fromMaybe 0) . getAttrMaybeR "margin"    -< ts
-  tsSpacing        <- arr (fromMaybe 0) . getAttrMaybeR "spacing"   -< ts
-  tsImages         <- images                                     -< ts
+  tsName           <- getAttrValue "name"                             -< ts
+  tsTileWidth      <- arr (fromMaybe 0) <<< getAttrR "tilewidth"      -< ts
+  tsTileHeight     <- arr (fromMaybe 0) <<< getAttrR "tileheight"     -< ts
+  tsTileCount      <- arr (fromMaybe 0) <<< getAttrMaybeR "tilecount" -< ts
+  tsMargin         <- arr (fromMaybe 0) <<< getAttrMaybeR "margin"    -< ts
+  tsSpacing        <- arr (fromMaybe 0) <<< getAttrMaybeR "spacing"   -< ts
+  tsImages         <- images                                          -< ts
   --tsTileProperties <- listA tileProperties                          -< ts
   tsProperties <- listA properties -< ts
-  tsTiles      <- listA tile       -< ts
+  tsTiles      <- listA tile -< ts
   returnA -< Tileset {..}
     where images = listA (getChildren >>> image)
 
@@ -260,16 +269,16 @@ data ImageType = TileImage | NormalImage deriving (Read)
 
 image :: IOSArrow XmlTree Image
 image = isElem >>> hasName "image" >>> proc img -> do
-    iWidth  <- getAttrR "width"        -< img
-    iHeight <- getAttrR "height"       -< img
-    iSource <- getAttrValue0 "source"  -< img
-    iTrans  <- arr (fmap colorToTriplet) . getAttrMaybe "trans" -< img
-    returnA -< Image {..}
-    where
-        colorToTriplet :: Integral i => String -> (i,i,i)
-        colorToTriplet x = (h x , h (drop 2 x) , h (drop 4 x))
-            where h (y:z:_) = fromIntegral $ digitToInt y * 16 + digitToInt z
-                  h _ = error "invalid color in an <image ...> somewhere."
+  iWidth  <- arr (fromMaybe 0) <<< getAttrMaybeR "width"      -< img
+  iHeight <- arr (fromMaybe 0) <<< getAttrMaybeR "height"     -< img
+  iSource <- getAttrValue0 "source"  -< img
+  iTrans  <- arr (fmap colorToTriplet) . getAttrMaybe "trans" -< img
+  returnA -< Image {..}
+  where
+      colorToTriplet :: Integral i => String -> (i,i,i)
+      colorToTriplet x = (h x , h (drop 2 x) , h (drop 4 x))
+          where h (y:z:_) = fromIntegral $ digitToInt y * 16 + digitToInt z
+                h _       = error "invalid color in an <image ...> somewhere."
 
 --tileImage :: IOSArrow XmlTree Image
 --tileImage = isElem >>> hasName "tile" >>> getChildren >>> image

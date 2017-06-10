@@ -23,6 +23,7 @@ Library
                      , bytestring
                      , filepath
                      , hxt >= 9.0
+                     , safe
                      , split
                      , vector
                      , zlib >= 0.5

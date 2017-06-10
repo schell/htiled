@@ -99,7 +99,7 @@ data LayerContents = LayerContentsTiles   TileData
                    deriving (Eq)
 
 instance Show LayerContents where
-    show (LayerContentsTiles _)      = "LayerContentsTiles ..."
+    show (LayerContentsTiles _)      = "LayerContentsTiles "   ++ show "..."
     show (LayerContentsObjects objs) = "LayerContentsObjects " ++ show objs
     show (LayerContentsImage img)    = "LayerContentsImage "   ++ show img
 
